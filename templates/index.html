@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Battery Health Monitor — Samsung</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body>
+    <!-- ═══ HEADER ═══════════════════════════════════════════════════════════ -->
+    <header class="header">
+      <div class="header-brand">
+        <span class="brand-icon">🔋</span>
+        <div>
+          <h1 class="brand-title">Battery Health Monitor</h1>
+          <p class="brand-sub">Samsung Galaxy</p>
+        </div>
+      </div>
+      <div class="header-controls">
+        <select id="model-select" class="select">
+          {% for m in modelos %}
+          <option value="{{ m }}">
+            {{ m }}
+          </option>
+          {% endfor %}
+        </select>
+        <div id="live-badge" class="badge badge-live">⬤ En vivo</div>
+        <button id="refresh-btn" class="btn btn-primary">↻ Actualizar</button>
+      </div>
+    </header>
+
+    <!-- ═══ ERROR BANNER ══════════════════════════════════════════════════════ -->
+    <div id="error-banner" class="error-banner hidden">
+      <span>⚠️</span>
+      <span id="error-message">No se detectó dispositivo</span>
+      <button
+        onclick="
+          document.getElementById('error-banner').classList.add('hidden')
+        "
+        class="error-close"
+      >
+        ✕
+      </button>
+    </div>
+
+    <!-- ═══ MAIN ══════════════════════════════════════════════════════════════ -->
+    <main class="main">
+      <!-- ── ROW 1: GAUGE + METRIC CARDS ─────────────────────────────────── -->
+      <section class="hero-row">
+        <!-- Circular gauge -->
+        <div class="card gauge-card">
+          <div class="gauge-wrapper">
+            <svg class="gauge-svg" viewBox="0 0 220 220" aria-hidden="true">
+              <!-- Decorative outer ring -->
+              <circle cx="110" cy="110" r="104" class="gauge-ring" />
+              <!-- Track -->
+              <circle
+                cx="110"
+                cy="110"
+                r="88"
+                class="gauge-track"
+                stroke-dasharray="552.92"
+                stroke-dashoffset="0"
+                transform="rotate(-90 110 110)"
+              />
+              <!-- Progress arc -->
+              <circle
+                cx="110"
+                cy="110"
+                r="88"
+                id="gauge-arc"
+                class="gauge-arc"
+                stroke-dasharray="552.92"
+                stroke-dashoffset="552.92"
+                transform="rotate(-90 110 110)"
+              />
+            </svg>
+            <div class="gauge-center">
+              <div id="gauge-pct" class="gauge-pct">—</div>
+              <div id="gauge-label" class="gauge-label">Sin datos</div>
+              <div id="gauge-mah" class="gauge-mah">— mAh</div>
+            </div>
+          </div>
+          <div class="gauge-footer">
+            <div class="gauge-footer-item">
+              <span class="gauge-footer-key">Fábrica</span>
+              <span id="gauge-design" class="gauge-footer-val">5000 mAh</span>
+            </div>
+            <div class="gauge-footer-sep"></div>
+            <div class="gauge-footer-item">
+              <span class="gauge-footer-key">Método</span>
+              <span id="gauge-method" class="gauge-footer-val dim">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 6 Metric cards -->
+        <div class="metrics-grid">
+          <div class="card metric-card" id="mc-level">
+            <div class="metric-top">
+              <span class="metric-icon">🔋</span>
+              <span id="m-level" class="metric-value">—</span>
+            </div>
+            <div class="metric-label">Nivel de carga</div>
+            <div class="level-bar">
+              <div
+                id="level-bar-fill"
+                class="level-bar-fill"
+                style="width: 0%"
+              ></div>
+            </div>
+          </div>
+
+          <div class="card metric-card" id="mc-status">
+            <div class="metric-top">
+              <span class="metric-icon">⚙️</span>
+              <span id="m-status" class="metric-value metric-sm">—</span>
+            </div>
+            <div class="metric-label">Estado</div>
+          </div>
+
+          <div class="card metric-card" id="mc-temp">
+            <div class="metric-top">
+              <span class="metric-icon">🌡️</span>
+              <span id="m-temp" class="metric-value">—</span>
+            </div>
+            <div class="metric-label">Temperatura</div>
+          </div>
+
+          <div class="card metric-card" id="mc-voltage">
+            <div class="metric-top">
+              <span class="metric-icon">⚡</span>
+              <span id="m-voltage" class="metric-value">—</span>
+            </div>
+            <div class="metric-label">Voltaje</div>
+          </div>
+
+          <div class="card metric-card" id="mc-counter">
+            <div class="metric-top">
+              <span class="metric-icon">🔌</span>
+              <span id="m-counter" class="metric-value">—</span>
+            </div>
+            <div class="metric-label">Capacidad actual</div>
+          </div>
+
+          <div class="card metric-card" id="mc-android">
+            <div class="metric-top">
+              <span class="metric-icon">💚</span>
+              <span id="m-android" class="metric-value metric-sm">—</span>
+            </div>
+            <div class="metric-label">Salud Android</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── ROW 2: HISTORICAL CHART ──────────────────────────────────────── -->
+      <section class="card chart-card">
+        <div class="chart-header">
+          <div>
+            <h2 class="section-title">📈 Historial de Salud</h2>
+            <p id="chart-subtitle" class="section-sub dim">
+              Evolución de la salud de la batería
+            </p>
+          </div>
+          <div class="chart-controls">
+            <div class="day-selector" id="day-selector">
+              <button class="day-btn" data-days="7">7d</button>
+              <button class="day-btn active" data-days="30">30d</button>
+              <button class="day-btn" data-days="90">90d</button>
+              <button class="day-btn" data-days="365">1 año</button>
+            </div>
+            <a href="/api/export/csv" class="btn btn-secondary" download
+              >⬇ CSV</a
+            >
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="health-chart"></canvas>
+          <div id="chart-empty" class="chart-empty hidden">
+            <div class="chart-empty-icon">📊</div>
+            <p>No hay datos históricos aún.</p>
+            <p class="dim">
+              Cada vez que uses el monitor se guardará una lectura.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── ROW 3: STATS ─────────────────────────────────────────────────── -->
+      <section class="stats-row">
+        <!-- Lecturas -->
+        <div class="card stat-card">
+          <h3 class="stat-title">📋 Lecturas</h3>
+          <ul class="stat-list">
+            <li class="stat-item">
+              <span class="stat-key">Total guardadas</span>
+              <span id="s-total" class="stat-val">—</span>
+            </li>
+            <li class="stat-item">
+              <span class="stat-key">Primera lectura</span>
+              <span id="s-first-date" class="stat-val">—</span>
+            </li>
+            <li class="stat-item">
+              <span class="stat-key">Salud inicial</span>
+              <span id="s-first-health" class="stat-val">—</span>
+            </li>
+            <li class="stat-item">
+              <span class="stat-key">Salud actual</span>
+              <span id="s-last-health" class="stat-val">—</span>
+            </li>
+            <li class="stat-item">
+              <span class="stat-key">Temp. máx. registrada</span>
+              <span id="s-max-temp" class="stat-val">—</span>
+            </li>
+          </ul>
+        </div>
+
+        <!-- Degradación -->
+        <div class="card stat-card">
+          <h3 class="stat-title">📉 Degradación</h3>
+          <ul class="stat-list">
+            <li class="stat-item">
+              <span class="stat-key">Tasa mensual</span>
+              <span id="s-monthly" class="stat-val">—</span>
+            </li>
+            <li class="stat-item">
+              <span class="stat-key">Tiempo estimado para 80%</span>
+              <span id="s-to-80" class="stat-val">—</span>
+            </li>
+          </ul>
+          <div id="projection-wrap" class="projection hidden">
+            <div class="proj-labels">
+              <span id="proj-current-label" class="proj-label-left">—</span>
+              <span class="proj-label-right">80%</span>
+            </div>
+            <div class="proj-track">
+              <div id="proj-fill" class="proj-fill"></div>
+              <div class="proj-marker"></div>
+            </div>
+            <p class="proj-note dim">
+              Samsung considera 80% como salud mínima aceptable.
+            </p>
+          </div>
+        </div>
+
+        <!-- Alertas -->
+        <div class="card stat-card">
+          <h3 class="stat-title">⚠️ Alertas</h3>
+          <div id="alerts-list" class="alerts-list">
+            <p class="no-alerts dim">Sin alertas activas ✓</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ═══ FOOTER ════════════════════════════════════════════════════════════ -->
+    <footer class="footer">
+      <span id="last-update" class="dim">Última actualización: —</span>
+      <span id="status-dot" class="status-dot status-unknown"
+        >⬤ Sin conexión</span
+      >
+    </footer>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
