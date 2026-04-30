@@ -5,27 +5,61 @@
 "use strict";
 
 // ── Config ────────────────────────────────────────────────
-const REFRESH_MS = 30_000; // Auto-refresh interval
-const CIRCUMF = 552.92; // 2π × 88  (gauge SVG radius)
+const REFRESH_MS   = 30_000; // Auto-refresh interval
+const CIRCUMF      = 552.92; // 2π × 88  (gauge SVG radius)
+const RT_MAX_PTS   = 120;    // Máx. puntos en tiempo real (~1 h a 30 s)
 
 // ── State ─────────────────────────────────────────────────
-let chart = null;
-let refreshTimer = null;
-let currentModel = document.getElementById("model-select").value;
-let currentDays = 30;
+let chart         = null;
+let refreshTimer  = null;
+let currentModel  = document.getElementById("model-select").value;
+let sessionStart  = null;
+const rtBuffer    = []; // buffer de lecturas de la sesión actual
 
 // ── DOM helpers ───────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
 const el = (id) => document.getElementById(id);
 
+// ── Count-up animation ────────────────────────────────────
+function animateNumber(el, toValue, suffix = "", decimals = 1) {
+  const from = parseFloat(el.dataset.rawValue ?? toValue) || 0;
+  el.dataset.rawValue = toValue;
+
+  if (Math.abs(from - toValue) < 0.05) {
+    el.textContent = toValue.toFixed(decimals) + suffix;
+    return;
+  }
+
+  // Pop animation on metric-value elements
+  if (el.classList.contains("metric-value")) {
+    el.classList.remove("value-pop");
+    void el.offsetWidth; // force reflow
+    el.classList.add("value-pop");
+    el.addEventListener("animationend", () => el.classList.remove("value-pop"), { once: true });
+  }
+
+  const duration = 700;
+  const start = performance.now();
+
+  function tick(now) {
+    const t      = Math.min((now - start) / duration, 1);
+    const eased  = 1 - Math.pow(1 - t, 3);
+    const current = from + (toValue - from) * eased;
+    el.textContent = current.toFixed(decimals) + suffix;
+    if (t < 1) requestAnimationFrame(tick);
+  }
+
+  requestAnimationFrame(tick);
+}
+
 // ── Health color ──────────────────────────────────────────
 function healthColor(pct) {
-  if (pct === null || pct === undefined) return "#475569";
-  if (pct >= 90) return "#10b981";
-  if (pct >= 80) return "#22c55e";
-  if (pct >= 70) return "#f59e0b";
-  if (pct >= 60) return "#f97316";
-  return "#ef4444";
+  if (pct === null || pct === undefined) return "#274060";
+  if (pct >= 90) return "#00e676";
+  if (pct >= 80) return "#69f0ae";
+  if (pct >= 70) return "#ffd740";
+  if (pct >= 60) return "#ff9100";
+  return "#ff5252";
 }
 
 // ══════════════════════════════════════════════════════════
@@ -49,20 +83,12 @@ async function loadCurrentData() {
     updateCards(data);
     updateAlerts(data);
     updateFooter();
+    pushRealtime(data);
+    renderChart();
+    updateChartSubtitle();
   } catch (err) {
     showError("No se pudo conectar con el servidor. ¿Está corriendo app.py?");
     setStatus("error");
-  }
-}
-
-async function loadHistory() {
-  try {
-    const res = await fetch(`/api/history/${currentDays}`);
-    const readings = await res.json();
-    renderChart(readings);
-    updateChartSubtitle(readings);
-  } catch (_) {
-    /* silently ignore */
   }
 }
 
@@ -89,14 +115,21 @@ function updateGauge(data) {
     arc.style.strokeDashoffset = offset;
     arc.style.stroke = healthColor(pct);
 
-    $("gauge-pct").textContent = pct.toFixed(1) + "%";
+    // Sync outer glow arc
+    const arcGlow = $("gauge-arc-glow");
+    if (arcGlow) {
+      arcGlow.style.strokeDashoffset = offset;
+      arcGlow.style.stroke = healthColor(pct);
+    }
+
+    animateNumber($("gauge-pct"), pct, "%", 1);
     $("gauge-label").textContent = data.health_label || "—";
     $("gauge-label").style.color = healthColor(pct);
 
     const mah = data.full_mah_est
       ? Math.round(data.full_mah_est)
-      : (data.current_mah ?? "—");
-    $("gauge-mah").textContent = mah !== "—" ? `${mah} mAh` : "— mAh";
+      : (data.current_mah ?? null);
+    $("gauge-mah").textContent = mah !== null ? `${mah} mAh` : "— mAh";
   } else {
     arc.style.strokeDashoffset = CIRCUMF;
     $("gauge-pct").textContent = "—";
@@ -121,33 +154,53 @@ function updateGauge(data) {
 // ══════════════════════════════════════════════════════════
 
 function updateCards(data) {
-  // Level
+  // Level — count-up + gradient bar
   const lvl = data.level ?? 0;
-  $("m-level").textContent = `${lvl}%`;
-  $("level-bar-fill").style.width = `${lvl}%`;
-  $("level-bar-fill").style.background =
-    lvl > 50 ? "var(--blue)" : lvl > 20 ? "var(--yellow)" : "var(--red)";
+  animateNumber($("m-level"), lvl, "%", 0);
+  const barFill = $("level-bar-fill");
+  barFill.style.width = `${lvl}%`;
+  if (lvl > 50) {
+    barFill.style.background  = "linear-gradient(90deg, #0099cc, #00ccff)";
+    barFill.style.boxShadow   = "0 0 8px rgba(0, 204, 255, 0.65)";
+  } else if (lvl > 20) {
+    barFill.style.background  = "linear-gradient(90deg, #cc8800, #ffd740)";
+    barFill.style.boxShadow   = "0 0 8px rgba(255, 215, 64, 0.5)";
+  } else {
+    barFill.style.background  = "linear-gradient(90deg, #aa2200, #ff5252)";
+    barFill.style.boxShadow   = "0 0 8px rgba(255, 82, 82, 0.55)";
+  }
 
   // Status
   $("m-status").textContent = data.status_name ?? "—";
 
-  // Temperature
+  // Temperature — count-up
   const temp = data.temp_c;
-  $("m-temp").textContent =
-    temp !== null && temp !== undefined ? `${temp} °C` : "—";
+  if (temp !== null && temp !== undefined) {
+    animateNumber($("m-temp"), temp, " °C", 1);
+  } else {
+    $("m-temp").textContent = "—";
+  }
   const mc = $("mc-temp");
   mc.classList.remove("warm", "hot");
   if (temp > 40) mc.classList.add("hot");
   else if (temp > 32) mc.classList.add("warm");
 
-  // Voltage
-  $("m-voltage").textContent = data.voltage_mv ? `${data.voltage_mv} mV` : "—";
+  // Voltage — count-up
+  if (data.voltage_mv) {
+    animateNumber($("m-voltage"), data.voltage_mv, " mV", 0);
+  } else {
+    $("m-voltage").textContent = "—";
+  }
 
-  // Charge counter → show as current mAh
+  // Charge counter → show as current mAh — count-up
   const mah =
     data.current_mah ??
     (data.charge_counter ? Math.round(data.charge_counter / 1000) : null);
-  $("m-counter").textContent = mah !== null ? `${mah} mAh` : "—";
+  if (mah !== null) {
+    animateNumber($("m-counter"), mah, " mAh", 0);
+  } else {
+    $("m-counter").textContent = "—";
+  }
 
   // Android health
   $("m-android").textContent = data.health_name ?? "—";
@@ -263,14 +316,29 @@ function updateStats(stats) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  CHART
+//  REALTIME BUFFER
 // ══════════════════════════════════════════════════════════
 
-function renderChart(readings) {
-  const canvas = $("health-chart");
-  const empty = $("chart-empty");
+function pushRealtime(data) {
+  if (!sessionStart) sessionStart = new Date();
+  const now = new Date();
+  rtBuffer.push({
+    time: now.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    health_pct: data.health_pct,
+    level: data.level,
+  });
+  if (rtBuffer.length > RT_MAX_PTS) rtBuffer.shift();
+}
 
-  if (!readings || readings.length < 2) {
+// ══════════════════════════════════════════════════════════
+//  CHART — tiempo real
+// ══════════════════════════════════════════════════════════
+
+function renderChart() {
+  const canvas = $("health-chart");
+  const empty  = $("chart-empty");
+
+  if (rtBuffer.length === 0) {
     canvas.classList.add("hidden");
     empty.classList.remove("hidden");
     return;
@@ -279,57 +347,53 @@ function renderChart(readings) {
   canvas.classList.remove("hidden");
   empty.classList.add("hidden");
 
-  const labels = readings.map((r) => {
-    const d = new Date(r.timestamp);
-    return d.toLocaleDateString("es-ES", { day: "2-digit", month: "short" });
-  });
-
-  const healthData = readings.map((r) => r.health_pct);
-  const levelData = readings.map((r) => r.level);
+  const labels     = rtBuffer.map((r) => r.time);
+  const healthData = rtBuffer.map((r) => r.health_pct);
+  const levelData  = rtBuffer.map((r) => r.level);
 
   const ctx = canvas.getContext("2d");
 
-  // Gradient fill for health line
   const grad = ctx.createLinearGradient(0, 0, 0, 260);
-  grad.addColorStop(0, "rgba(59, 130, 246, 0.35)");
-  grad.addColorStop(1, "rgba(59, 130, 246, 0.0)");
+  grad.addColorStop(0, "rgba(0, 204, 255, 0.30)");
+  grad.addColorStop(1, "rgba(0, 204, 255, 0.0)");
 
   const gradLevel = ctx.createLinearGradient(0, 0, 0, 260);
-  gradLevel.addColorStop(0, "rgba(16, 185, 129, 0.2)");
-  gradLevel.addColorStop(1, "rgba(16, 185, 129, 0.0)");
+  gradLevel.addColorStop(0, "rgba(0, 230, 118, 0.15)");
+  gradLevel.addColorStop(1, "rgba(0, 230, 118, 0.0)");
+
+  const pr = rtBuffer.length < 12 ? 4 : 2;
 
   const datasets = [
     {
       label: "Salud (%)",
       data: healthData,
-      borderColor: "#3b82f6",
+      borderColor: "#00ccff",
       backgroundColor: grad,
       borderWidth: 2.5,
-      pointRadius: readings.length < 15 ? 4 : 2,
-      pointBackgroundColor: "#3b82f6",
-      pointBorderColor: "#0f172a",
+      pointRadius: pr,
+      pointBackgroundColor: "#00ccff",
+      pointBorderColor: "#071525",
       pointBorderWidth: 2,
       tension: 0.35,
       fill: true,
-      yAxisID: "y",
     },
     {
       label: "Carga (%)",
       data: levelData,
-      borderColor: "#10b981",
+      borderColor: "#00e676",
       backgroundColor: gradLevel,
       borderWidth: 1.5,
       pointRadius: 0,
       tension: 0.35,
       fill: true,
       borderDash: [4, 4],
-      yAxisID: "y",
     },
   ];
 
   if (chart) {
-    chart.data.labels = labels;
-    chart.data.datasets = datasets;
+    chart.data.labels        = labels;
+    chart.data.datasets      = datasets;
+    chart.options.scales.y.min = _yMin(healthData, levelData);
     chart.update("active");
     return;
   }
@@ -340,45 +404,50 @@ function renderChart(readings) {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: { duration: 500 },
       interaction: { mode: "index", intersect: false },
       plugins: {
         legend: {
           labels: {
-            color: "#94a3b8",
+            color: "#5f8fad",
             font: { family: "Inter", size: 12 },
             usePointStyle: true,
             pointStyleWidth: 10,
           },
         },
         tooltip: {
-          backgroundColor: "#0f172a",
-          borderColor: "#1e2d45",
+          backgroundColor: "rgba(5, 16, 30, 0.92)",
+          borderColor: "rgba(0, 204, 255, 0.2)",
           borderWidth: 1,
-          titleColor: "#f1f5f9",
-          bodyColor: "#94a3b8",
-          padding: 12,
+          titleColor: "#eaf4ff",
+          bodyColor: "#5f8fad",
+          padding: 14,
+          cornerRadius: 10,
+          displayColors: true,
+          boxWidth: 8,
+          boxHeight: 8,
+          boxPadding: 4,
           callbacks: {
-            label: (ctx) =>
-              ` ${ctx.dataset.label}: ${ctx.parsed.y?.toFixed(1) ?? "—"}%`,
+            label: (c) => ` ${c.dataset.label}: ${c.parsed.y?.toFixed(1) ?? "—"}%`,
           },
         },
       },
       scales: {
         x: {
-          grid: { color: "rgba(30, 45, 69, 0.7)", drawBorder: false },
+          grid: { color: "rgba(15, 37, 64, 0.8)", drawBorder: false },
           ticks: {
-            color: "#475569",
+            color: "#274060",
             font: { family: "Inter", size: 11 },
             maxTicksLimit: 8,
           },
           border: { display: false },
         },
         y: {
-          min: Math.max(0, Math.min(...healthData.filter(Boolean)) - 5),
-          max: 101,
-          grid: { color: "rgba(30, 45, 69, 0.7)", drawBorder: false },
+          min: _yMin(healthData, levelData),
+          max: 102,
+          grid: { color: "rgba(15, 37, 64, 0.8)", drawBorder: false },
           ticks: {
-            color: "#475569",
+            color: "#274060",
             font: { family: "Inter", size: 11 },
             callback: (v) => v + "%",
           },
@@ -389,21 +458,22 @@ function renderChart(readings) {
   });
 }
 
-function updateChartSubtitle(readings) {
+function _yMin(healthData, levelData) {
+  const all = [...healthData, ...levelData].filter((v) => v !== null && v !== undefined);
+  return all.length ? Math.max(0, Math.min(...all) - 5) : 0;
+}
+
+function updateChartSubtitle() {
   const sub = $("chart-subtitle");
-  if (!readings || readings.length === 0) {
-    sub.textContent = "Sin datos aún";
+  if (!sessionStart || rtBuffer.length === 0) {
+    sub.textContent = "Esperando primera lectura…";
     return;
   }
-  const first = new Date(readings[0].timestamp);
-  const last = new Date(readings[readings.length - 1].timestamp);
-  const fmt = (d) =>
-    d.toLocaleDateString("es-ES", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
-  sub.textContent = `${readings.length} lecturas · ${fmt(first)} → ${fmt(last)}`;
+  const n       = rtBuffer.length;
+  const mins    = Math.floor((Date.now() - sessionStart.getTime()) / 60000);
+  const inicio  = sessionStart.toLocaleTimeString("es-ES", { hour: "2-digit", minute: "2-digit" });
+  const durStr  = mins > 0 ? `${mins} min · ` : "";
+  sub.textContent = `${n} lectura${n !== 1 ? "s" : ""} · ${durStr}desde las ${inicio}`;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -446,7 +516,6 @@ function stopRefresh() {
 
 async function refreshAll() {
   await loadCurrentData();
-  await loadHistory();
   await loadStats();
 }
 
@@ -463,22 +532,11 @@ $("model-select").addEventListener("change", async (e) => {
 // Manual refresh button
 $("refresh-btn").addEventListener("click", async () => {
   const btn = $("refresh-btn");
-  btn.textContent = "↻ …";
+  btn.classList.add("loading");
   btn.disabled = true;
   await refreshAll();
-  btn.textContent = "↻ Actualizar";
+  btn.classList.remove("loading");
   btn.disabled = false;
-});
-
-// Day selector buttons
-$("day-selector").addEventListener("click", async (e) => {
-  if (!e.target.matches(".day-btn")) return;
-  document
-    .querySelectorAll(".day-btn")
-    .forEach((b) => b.classList.remove("active"));
-  e.target.classList.add("active");
-  currentDays = parseInt(e.target.dataset.days, 10);
-  await loadHistory();
 });
 
 // ══════════════════════════════════════════════════════════
@@ -488,11 +546,21 @@ $("day-selector").addEventListener("click", async (e) => {
 document.addEventListener("DOMContentLoaded", async () => {
   try {
     const res = await fetch("/api/detect");
-    const { modelo } = await res.json();
+    const { modelo, brand, raw_model, is_samsung } = await res.json();
     if (modelo) {
       const sel = $("model-select");
       sel.value = modelo;
       currentModel = modelo;
+    }
+    const chip = $("device-chip");
+    const sel  = $("model-select");
+    if (!is_samsung) {
+      const label = brand
+        ? (raw_model ? `📱 ${brand} ${raw_model}` : `📱 ${brand}`)
+        : "📱 Otro";
+      chip.textContent = label;
+      chip.classList.remove("hidden");
+      sel.classList.add("hidden");
     }
   } catch (_) { /* si falla, usa el primer modelo de la lista */ }
 

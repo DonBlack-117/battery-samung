@@ -12,11 +12,13 @@ Real-time battery health monitoring dashboard for Samsung Android devices. Conne
 - **Real-time monitoring** — battery level, health %, voltage, temperature, and capacity
 - **Historical tracking** — stores readings in SQLite and plots trends over 7d / 30d / 90d / 1 year
 - **Degradation analysis** — monthly degradation rate and estimated months until 80% health threshold
-- **Samsung model detection** — auto-detects 30+ Galaxy models (S-series, Note, A-series) via ADB
+- **Samsung model detection** — auto-detects 30+ Galaxy models (S-series, Note, A-series) via ADB; also reports brand and raw model for non-Samsung devices
+- **Renovation risk analysis** — detects signs of refurbished devices: cycle count, Knox warranty bit, Knox hardware fuse, battery health vs. claimed condition
 - **Battery protection detection** — identifies Samsung's "Protect Battery" feature that caps charge at 85%
 - **Temperature alerts** — warns at >35 °C and critical at >40 °C
 - **CSV export** — download up to one year of readings for external analysis
-- **CLI mode** — rich terminal output for quick checks or watch mode
+- **CLI mode** — rich terminal output for quick checks, watch mode, or renovation report
+- **Animated dashboard** — count-up number transitions and a live session chart that builds up in real time (up to 120 data points, ~1 hour at 30 s interval)
 
 ## Screenshots
 
@@ -68,6 +70,9 @@ python bateria.py --modelo "S23 Ultra"
 
 # List supported models
 python bateria.py --lista-modelos
+
+# Renovation risk report (cycle count, Knox fuse, warranty bit)
+python bateria.py --renovado
 ```
 
 ## Supported Samsung Models
@@ -80,7 +85,9 @@ S25 series · S24 series · S23 series · S22 series · S21 series · S20 series
 |--------|----------|-------------|
 | GET | `/` | Main dashboard |
 | GET | `/api/current/<model>` | Current battery data |
-| GET | `/api/detect` | Auto-detect connected device model |
+| GET | `/api/detect` | Detect connected device — returns `{modelo, brand, raw_model, is_samsung}` |
+| GET | `/api/renovation` | Renovation risk report for the connected device |
+| GET | `/api/renovation/<model>` | Renovation risk report with explicit model |
 | GET | `/api/history/<days>` | Historical readings |
 | GET | `/api/stats` | Aggregated statistics |
 | GET | `/api/export/csv` | Download CSV export |

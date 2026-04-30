@@ -4,11 +4,12 @@ Script para revisar la salud real de la batería en dispositivos Samsung.
 Requiere: ADB instalado y USB Debugging activado en el teléfono.
 
 Uso:
-  python bateria.py                        # Lectura única
+  python bateria.py                        # Lectura única (auto-detecta modelo)
   python bateria.py --watch 5              # Actualizar cada 5 segundos
   python bateria.py --json                 # Salida en formato JSON
   python bateria.py --modelo "S23 Ultra"   # Especificar modelo Samsung
   python bateria.py --lista-modelos        # Ver modelos disponibles
+  python bateria.py --renovado             # Análisis de dispositivo renovado
 """
 
 import argparse
@@ -19,9 +20,17 @@ import sys
 import time
 from pathlib import Path
 
-# Usa adb.exe local en adb/ si existe; si no, busca en el PATH del sistema
-_ADB_LOCAL = Path(__file__).parent / "adb" / "adb.exe"
-_ADB_CMD = str(_ADB_LOCAL) if _ADB_LOCAL.exists() else "adb"
+# adb.exe está en adb/compiled/ pero necesita las DLLs de adb/
+# Copiamos el exe junto a las DLLs si aún no está ahí, y usamos esa ruta.
+_ADB_DIR = Path(__file__).parent / "adb"
+_ADB_EXE = _ADB_DIR / "adb.exe"
+_ADB_COMPILED = _ADB_DIR / "compiled" / "adb.exe"
+
+if not _ADB_EXE.exists() and _ADB_COMPILED.exists():
+    import shutil
+    shutil.copy2(_ADB_COMPILED, _ADB_EXE)
+
+_ADB_CMD = str(_ADB_EXE) if _ADB_EXE.exists() else "adb"
 
 try:
     from rich.console import Console
@@ -167,6 +176,10 @@ def safe_int(value, default=0) -> int:
         return default
 
 
+class ADBNotFoundError(RuntimeError):
+    """Se lanza cuando el ejecutable ADB no puede encontrarse."""
+
+
 def run_adb(command: list) -> tuple[str, int]:
     try:
         result = subprocess.run(
@@ -177,20 +190,12 @@ def run_adb(command: list) -> tuple[str, int]:
         )
         return result.stdout.strip(), result.returncode
     except FileNotFoundError:
-        _print_error(
+        raise ADBNotFoundError(
             "ADB no está instalado o no está en el PATH.\n"
             "Descárgalo en: https://developer.android.com/studio/releases/platform-tools"
         )
-        sys.exit(1)
     except subprocess.TimeoutExpired:
         return "", 1
-
-
-def _print_error(msg: str):
-    if RICH_AVAILABLE:
-        console.print(f"[bold red]❌ {msg}[/bold red]")
-    else:
-        print(f"❌ {msg}")
 
 
 def get_health_info(pct: float) -> tuple[str, str]:
@@ -224,16 +229,39 @@ def detect_device_model() -> str | None:
     return None
 
 
+def detect_device_info() -> dict:
+    """Detecta marca, modelo y si es Samsung del dispositivo conectado.
+    Retorna: {"modelo": str|None, "brand": str|None, "raw_model": str|None, "is_samsung": bool}
+    """
+    brand_raw, _ = run_adb(["shell", "getprop", "ro.product.brand"])
+    manufacturer_raw, _ = run_adb(["shell", "getprop", "ro.product.manufacturer"])
+    raw_model_raw, _ = run_adb(["shell", "getprop", "ro.product.model"])
+
+    brand = (brand_raw.strip() or manufacturer_raw.strip() or None)
+    brand_display = brand.title() if brand else None
+    raw_model = raw_model_raw.strip() or None
+
+    is_samsung = bool(brand and "samsung" in brand.lower())
+    samsung_model = detect_device_model() if is_samsung else None
+
+    return {
+        "modelo": samsung_model,
+        "brand": brand_display,
+        "raw_model": raw_model,
+        "is_samsung": is_samsung,
+    }
+
+
 def check_device():
     output, _ = run_adb(["devices"])
     lines = [l for l in output.splitlines() if l.endswith("device")]
     if not lines:
-        _print_error("No se detectó ningún dispositivo.")
-        print("   Asegúrate de:")
-        print("   1. Conectar el teléfono por USB")
-        print("   2. Tener activado 'Depuración USB' en Opciones para desarrolladores")
-        print("   3. Tocar 'Permitir' en el aviso del teléfono")
-        sys.exit(1)
+        raise RuntimeError(
+            "No se detectó ningún dispositivo.\n"
+            "   1. Conecta el teléfono por USB\n"
+            "   2. Activa 'Depuración USB' en Opciones para desarrolladores\n"
+            "   3. Toca 'Permitir' en el aviso del teléfono"
+        )
 
 
 def read_sys_value(path: str) -> int | None:
@@ -344,6 +372,234 @@ def calculate_health(data: dict, design_capacity_mah: int) -> dict:
         "health_name": HEALTH_NAMES.get(data["health_code"], str(data["health_code"])),
         "status_name": STATUS_NAMES.get(data["status_code"], str(data["status_code"])),
     }
+
+
+# ── Detección de dispositivo renovado ────────────────────────────────────────
+
+# Thresholds de ciclos de batería para clasificar el uso
+_CYCLE_HIGH = 300
+_CYCLE_MEDIUM = 150
+_CYCLE_LOW = 50
+
+
+def get_renovation_indicators() -> dict:
+    """
+    Recopila indicadores ADB que pueden revelar si el dispositivo es renovado.
+
+    Indicadores clave:
+    - cycle_count: ciclos de carga acumulados (muy fiable)
+    - warranty_bit / boot_warranty_bit: fuse de Knox quemado (irreversible)
+    - knox_fuse: fusible de hardware (/efs/FactoryApp/fuse); requiere permisos
+    - serial: número de serie para registro manual
+    - build_fingerprint: firmware oficial vs. flasheado
+    """
+    def _getprop(prop: str) -> str | None:
+        val, code = run_adb(["shell", "getprop", prop])
+        return val.strip() or None if code == 0 else None
+
+    def _cat(path: str) -> str | None:
+        val, code = run_adb(["shell", f"cat {path} 2>/dev/null"])
+        return val.strip() or None if code == 0 else None
+
+    cycle_raw = read_sys_value("/sys/class/power_supply/battery/cycle_count")
+
+    return {
+        "cycle_count": cycle_raw,
+        "warranty_bit": _getprop("ro.warranty_bit"),
+        "boot_warranty_bit": _getprop("ro.boot.warranty_bit"),
+        # Knox fuse de hardware — "1" = quemado de forma irreversible
+        # Solo accesible con permisos de sistema en la mayoría de dispositivos
+        "knox_fuse": _cat("/efs/FactoryApp/fuse"),
+        "serial": _getprop("ro.serialno") or _getprop("ro.boot.serialno"),
+        "build_fingerprint": _getprop("ro.build.fingerprint"),
+        "model_raw": _getprop("ro.product.model"),
+    }
+
+
+def analyze_renovation_risk(indicators: dict, health_pct: float | None) -> dict:
+    """
+    Evalúa los indicadores y devuelve un nivel de riesgo con factores detallados.
+
+    Retorna un dict con:
+    - risk_level: "Bajo" | "Medio" | "Alto"
+    - risk_factors: lista de señales de alerta
+    - green_flags: lista de indicadores positivos
+    - cycle_count, warranty_voided, knox_fuse_triggered
+    """
+    risk_factors: list[str] = []
+    green_flags: list[str] = []
+
+    # ── Ciclos de batería ─────────────────────────────────────────────────────
+    cycles = indicators.get("cycle_count")
+    if cycles is not None:
+        if cycles >= _CYCLE_HIGH:
+            risk_factors.append(
+                f"Ciclos de carga muy altos: {cycles} "
+                f"(dispositivo con uso intensivo — >={_CYCLE_HIGH} es señal de alarma)"
+            )
+        elif cycles >= _CYCLE_MEDIUM:
+            risk_factors.append(
+                f"Ciclos de carga moderados: {cycles} "
+                f"(uso significativo antes de esta compra)"
+            )
+        elif cycles >= _CYCLE_LOW:
+            green_flags.append(f"Ciclos de carga aceptables: {cycles}")
+        else:
+            green_flags.append(f"Ciclos de carga muy bajos: {cycles} (prácticamente nuevo)")
+    else:
+        risk_factors.append(
+            "No se pudo leer cycle_count — el dispositivo puede estar restringiendo "
+            "acceso a /sys/class/power_supply/battery/cycle_count"
+        )
+
+    # ── Knox warranty bit ─────────────────────────────────────────────────────
+    warranty_voided = (
+        indicators.get("warranty_bit") == "1"
+        or indicators.get("boot_warranty_bit") == "1"
+    )
+    if warranty_voided:
+        risk_factors.append(
+            "Warranty bit activado (ro.warranty_bit=1) — el dispositivo fue "
+            "desbloqueado, flasheado con firmware no oficial, o reparado con "
+            "componentes no Samsung. Este cambio es IRREVERSIBLE."
+        )
+    elif indicators.get("warranty_bit") == "0":
+        green_flags.append("Warranty bit intacto (ro.warranty_bit=0)")
+
+    # ── Knox fuse de hardware ─────────────────────────────────────────────────
+    knox_triggered = indicators.get("knox_fuse") == "1"
+    if knox_triggered:
+        risk_factors.append(
+            "Knox fuse de hardware quemado (/efs/FactoryApp/fuse=1) — "
+            "indica acceso no autorizado al sistema. Irreversible a nivel de hardware."
+        )
+    elif indicators.get("knox_fuse") == "0":
+        green_flags.append("Knox fuse de hardware intacto")
+
+    # ── Salud de batería vs. dispositivo "nuevo" ──────────────────────────────
+    if health_pct is not None:
+        if health_pct < 80:
+            risk_factors.append(
+                f"Salud de batería baja ({health_pct}%) para un dispositivo "
+                f"que se vende como nuevo o reacondicionado"
+            )
+        elif health_pct >= 95:
+            green_flags.append(f"Salud de batería excelente: {health_pct}%")
+        elif health_pct >= 85:
+            green_flags.append(f"Salud de batería buena: {health_pct}%")
+
+    # ── Firmware no oficial ───────────────────────────────────────────────────
+    fp = indicators.get("build_fingerprint") or ""
+    if fp and "samsung" not in fp.lower():
+        risk_factors.append(
+            f"Fingerprint de build inusual: '{fp}' — puede indicar firmware no oficial"
+        )
+
+    # ── Puntuación final ──────────────────────────────────────────────────────
+    n = len(risk_factors)
+    if n == 0:
+        risk_level, risk_color = "Bajo", "green"
+    elif n <= 2:
+        risk_level, risk_color = "Medio", "yellow"
+    else:
+        risk_level, risk_color = "Alto", "red"
+
+    return {
+        "risk_level": risk_level,
+        "risk_color": risk_color,
+        "risk_factors": risk_factors,
+        "green_flags": green_flags,
+        "cycle_count": cycles,
+        "warranty_voided": warranty_voided,
+        "knox_fuse_triggered": knox_triggered,
+        "serial": indicators.get("serial"),
+        "build_fingerprint": fp or None,
+    }
+
+
+def display_renovation_report(report: dict):
+    """Muestra el reporte de renovado en consola."""
+    if RICH_AVAILABLE:
+        _display_renovation_rich(report)
+    else:
+        _display_renovation_plain(report)
+
+
+def _display_renovation_rich(r: dict):
+    color = r["risk_color"]
+    level = r["risk_level"]
+
+    lines = [f"[bold]Riesgo:[/bold] [{color}]{level}[/{color}]\n"]
+
+    if r["cycle_count"] is not None:
+        lines.append(f"[bold]Ciclos de carga:[/bold] {r['cycle_count']}")
+    lines.append(
+        f"[bold]Warranty bit:[/bold] "
+        + ("[red]Quemado (voided)[/red]" if r["warranty_voided"] else "[green]Intacto[/green]")
+    )
+    lines.append(
+        f"[bold]Knox fuse HW:[/bold]  "
+        + ("[red]Activado[/red]" if r["knox_fuse_triggered"] else "[green]Intacto[/green]")
+    )
+    if r["serial"]:
+        lines.append(f"[bold]N° de serie:[/bold]   {r['serial']}")
+
+    if r["risk_factors"]:
+        lines.append("\n[bold red]⚠ Factores de riesgo:[/bold red]")
+        for f in r["risk_factors"]:
+            lines.append(f"  • {f}")
+
+    if r["green_flags"]:
+        lines.append("\n[bold green]✓ Indicadores positivos:[/bold green]")
+        for g in r["green_flags"]:
+            lines.append(f"  • {g}")
+
+    lines.append(
+        "\n[dim]Nota: ningún método ADB puede determinar con certeza si un dispositivo "
+        "es renovado. Estos indicadores son orientativos.[/dim]"
+    )
+
+    console.print()
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="🔍 Análisis de Dispositivo Renovado",
+            border_style=color,
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _display_renovation_plain(r: dict):
+    W = 60
+    color_sym = {"green": "✓", "yellow": "⚠", "red": "✗"}
+    sym = color_sym.get(r["risk_color"], "?")
+    print()
+    print("=" * W)
+    print(f"  🔍  ANÁLISIS DE DISPOSITIVO RENOVADO")
+    print("=" * W)
+    print(f"  {sym}  Nivel de riesgo: {r['risk_level']}")
+    if r["cycle_count"] is not None:
+        print(f"  🔄  Ciclos de carga:  {r['cycle_count']}")
+    print(f"  🔑  Warranty bit:    {'QUEMADO' if r['warranty_voided'] else 'Intacto'}")
+    print(f"  🔒  Knox fuse HW:    {'ACTIVADO' if r['knox_fuse_triggered'] else 'Intacto'}")
+    if r["serial"]:
+        print(f"  📋  N° de serie:     {r['serial']}")
+
+    if r["risk_factors"]:
+        print("\n  ⚠ Factores de riesgo:")
+        for f in r["risk_factors"]:
+            print(f"    • {f}")
+    if r["green_flags"]:
+        print("\n  ✓ Indicadores positivos:")
+        for g in r["green_flags"]:
+            print(f"    • {g}")
+
+    print()
+    print("  Nota: ningún método ADB puede determinar con certeza si un")
+    print("  dispositivo es renovado. Estos indicadores son orientativos.")
+    print("=" * W)
+    print()
 
 
 # ── Presentación ──────────────────────────────────────────────────────────────
@@ -546,7 +802,33 @@ def parse_args():
         action="store_true",
         help="Muestra los modelos Samsung disponibles y sus capacidades.",
     )
+    parser.add_argument(
+        "--renovado",
+        "-r",
+        action="store_true",
+        help="Analiza indicadores que pueden revelar si el dispositivo es renovado.",
+    )
     return parser.parse_args()
+
+
+def _resolve_model(args) -> tuple[str, int]:
+    """Detecta o valida el modelo. Retorna (nombre_modelo, mah_diseño)."""
+    # Si el usuario no pasó --modelo explícito, intentar auto-detección
+    explicit = "--modelo" in sys.argv or "-m" in sys.argv
+    modelo = args.modelo
+
+    if not explicit:
+        detected = detect_device_model()
+        if detected:
+            modelo = detected
+
+    design_mah = SAMSUNG_CAPACITIES.get(modelo)
+    if design_mah is None:
+        print(f"⚠️  Modelo '{modelo}' no reconocido. Usa --lista-modelos para ver opciones.")
+        print("   Si conoces la capacidad, puedes añadirlo a SAMSUNG_CAPACITIES.")
+        sys.exit(1)
+
+    return modelo, design_mah
 
 
 def main():
@@ -559,18 +841,28 @@ def main():
         print()
         return
 
-    modelo = args.modelo
-    design_mah = SAMSUNG_CAPACITIES.get(modelo)
-    if design_mah is None:
-        print(
-            f"⚠️  Modelo '{modelo}' no reconocido. Usa --lista-modelos para ver opciones."
-        )
-        print(
-            "   Si conoces la capacidad, puedes añadirlo al diccionario SAMSUNG_CAPACITIES."
-        )
+    try:
+        check_device()
+    except ADBNotFoundError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"❌ {e}")
         sys.exit(1)
 
-    check_device()
+    modelo, design_mah = _resolve_model(args)
+
+    if args.renovado:
+        data = get_battery_data()
+        results = calculate_health(data, design_mah)
+        indicators = get_renovation_indicators()
+        report = analyze_renovation_risk(indicators, results["health_pct"])
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            display_results(results, modelo)
+            display_renovation_report(report)
+        return
 
     def run_once():
         data = get_battery_data()
