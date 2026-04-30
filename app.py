@@ -13,11 +13,14 @@ from flask import Flask, Response, jsonify, render_template
 
 import database as db
 from bateria import (
+    ADBNotFoundError,
     SAMSUNG_CAPACITIES,
+    analyze_renovation_risk,
     calculate_health,
-    detect_device_model,
+    detect_device_info,
     get_battery_data,
     get_health_info,
+    get_renovation_indicators,
 )
 
 app = Flask(__name__)
@@ -52,11 +55,8 @@ def _get_current_data(modelo: str = "S24 Ultra") -> tuple[dict | None, str | Non
 
         return results, None
 
-    except SystemExit:
-        return None, (
-            "No se detectó dispositivo Android. "
-            "Conecta el teléfono y activa la Depuración USB."
-        )
+    except (ADBNotFoundError, RuntimeError) as exc:
+        return None, str(exc)
     except Exception as exc:
         return None, str(exc)
 
@@ -83,10 +83,20 @@ def api_current(modelo: str = "S24 Ultra"):
     return jsonify(data)
 
 
+@app.route("/api/renovation")
+@app.route("/api/renovation/<modelo>")
+def api_renovation(modelo: str = "S24 Ultra"):
+    data, error = _get_current_data(modelo)
+    if error:
+        return jsonify({"error": error}), 503
+    indicators = get_renovation_indicators()
+    report = analyze_renovation_risk(indicators, data.get("health_pct"))
+    return jsonify(report)
+
+
 @app.route("/api/detect")
 def api_detect():
-    modelo = detect_device_model()
-    return jsonify({"modelo": modelo})
+    return jsonify(detect_device_info())
 
 
 @app.route("/api/history")
